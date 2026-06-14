@@ -154,7 +154,7 @@ func backoff(attempt int) time.Duration {
 
 // MoleculeProps holds physico-chemical properties for a molecule.
 type MoleculeProps struct {
-	Formula   string `json:"full_molecular_formula"`
+	Formula   string `json:"full_molformula"`
 	MolWeight string `json:"full_mwt"`
 }
 
@@ -165,10 +165,12 @@ type MoleculeStructs struct {
 
 // molecule is the raw API shape. Fields from nested objects are promoted into
 // the flat Molecule output type below.
+// Note: max_phase comes from the API as a JSON string (e.g. "4.0") so we
+// decode it as json.RawMessage and convert manually.
 type molecule struct {
 	ID       string           `json:"molecule_chembl_id"`
 	Name     string           `json:"pref_name"`
-	MaxPhase int              `json:"max_phase"`
+	MaxPhase json.RawMessage  `json:"max_phase"`
 	Type     string           `json:"molecule_type"`
 	Props    *MoleculeProps   `json:"molecule_properties"`
 	Structs  *MoleculeStructs `json:"molecule_structures"`
@@ -178,7 +180,7 @@ type molecule struct {
 type Molecule struct {
 	ID        string `json:"molecule_chembl_id" kit:"id"`
 	Name      string `json:"pref_name"`
-	MaxPhase  int    `json:"max_phase"`
+	MaxPhase  string `json:"max_phase,omitempty"`
 	Type      string `json:"molecule_type"`
 	Formula   string `json:"formula,omitempty"`
 	MolWeight string `json:"mol_weight,omitempty"`
@@ -187,10 +189,18 @@ type Molecule struct {
 
 func flatMolecule(m *molecule) *Molecule {
 	out := &Molecule{
-		ID:       m.ID,
-		Name:     m.Name,
-		MaxPhase: m.MaxPhase,
-		Type:     m.Type,
+		ID:   m.ID,
+		Name: m.Name,
+		Type: m.Type,
+	}
+	// max_phase may arrive as "4.0", 4, or null – normalise to string.
+	if len(m.MaxPhase) > 0 && string(m.MaxPhase) != "null" {
+		// strip surrounding quotes if it was encoded as a JSON string
+		s := string(m.MaxPhase)
+		if len(s) >= 2 && s[0] == '"' {
+			s = s[1 : len(s)-1]
+		}
+		out.MaxPhase = s
 	}
 	if m.Props != nil {
 		out.Formula = m.Props.Formula

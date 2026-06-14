@@ -35,8 +35,8 @@ func TestMolecule(t *testing.T) {
 			"max_phase":          4,
 			"molecule_type":      "Small molecule",
 			"molecule_properties": map[string]any{
-				"full_molecular_formula": "C9H8O4",
-				"full_mwt":               "180.16",
+				"full_molformula": "C9H8O4",
+				"full_mwt":        "180.16",
 			},
 			"molecule_structures": map[string]any{
 				"canonical_smiles": "CC(=O)Oc1ccccc1C(=O)O",
