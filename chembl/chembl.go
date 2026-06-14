@@ -1,62 +1,84 @@
 // Package chembl is the library behind the chembl command line:
-// the HTTP client, request shaping, and the typed data models for chembl.
+// the HTTP client, request shaping, and the typed data models for the
+// ChEMBL REST API (https://www.ebi.ac.uk/chembl/api/data).
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
 package chembl
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to chembl. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "chembl/dev (+https://github.com/tamnd/chembl-cli)"
+// DefaultUserAgent identifies the client to ChEMBL.
+const DefaultUserAgent = "chembl-cli/0.1.0 (github.com/tamnd/chembl-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at chembl.com; change it once you
-// know the real endpoints you want to read.
-const Host = "chembl.com"
+// Host is the EBI ChEMBL web host.
+const Host = "www.ebi.ac.uk"
 
 // BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+const BaseURL = "https://www.ebi.ac.uk/chembl/api/data"
 
-// Client talks to chembl over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds the tunable knobs for a Client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible defaults for calling the ChEMBL API.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      300 * time.Millisecond,
+		Timeout:   30 * time.Second,
+		Retries:   3,
 	}
 }
 
+// Client talks to the ChEMBL REST API over HTTP.
+type Client struct {
+	HTTP    *http.Client
+	cfg     Config
+	mu      sync.Mutex
+	last    time.Time
+}
+
+// NewClientWithConfig returns a Client built from the provided Config.
+func NewClientWithConfig(cfg Config) *Client {
+	return &Client{
+		HTTP: &http.Client{Timeout: cfg.Timeout},
+		cfg:  cfg,
+	}
+}
+
+// NewClient returns a Client with DefaultConfig.
+func NewClient() *Client {
+	return NewClientWithConfig(DefaultConfig())
+}
+
+// SetRetries updates the number of retries (useful in tests).
+func (c *Client) SetRetries(n int) {
+	c.cfg.Retries = n
+}
+
 // Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
+// to the client's config. The caller owns nothing extra; the body is read
 // fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +86,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,16 +95,17 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -106,10 +129,12 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 
 // pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -123,78 +148,200 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on chembl.com. It is a stand-in for the typed records you
-// will model from the real chembl endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `chembl cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// ---------------------------------------------------------------------------
+// Data models
+// ---------------------------------------------------------------------------
+
+// MoleculeProps holds physico-chemical properties for a molecule.
+type MoleculeProps struct {
+	Formula   string `json:"full_molecular_formula"`
+	MolWeight string `json:"full_mwt"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+// MoleculeStructs holds structural representations.
+type MoleculeStructs struct {
+	SMILES string `json:"canonical_smiles"`
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
+// molecule is the raw API shape. Fields from nested objects are promoted into
+// the flat Molecule output type below.
+type molecule struct {
+	ID       string           `json:"molecule_chembl_id"`
+	Name     string           `json:"pref_name"`
+	MaxPhase int              `json:"max_phase"`
+	Type     string           `json:"molecule_type"`
+	Props    *MoleculeProps   `json:"molecule_properties"`
+	Structs  *MoleculeStructs `json:"molecule_structures"`
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
+// Molecule is the flat output record for a ChEMBL molecule.
+type Molecule struct {
+	ID        string `json:"molecule_chembl_id" kit:"id"`
+	Name      string `json:"pref_name"`
+	MaxPhase  int    `json:"max_phase"`
+	Type      string `json:"molecule_type"`
+	Formula   string `json:"formula,omitempty"`
+	MolWeight string `json:"mol_weight,omitempty"`
+	SMILES    string `json:"smiles,omitempty" kit:"body"`
+}
 
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+func flatMolecule(m *molecule) *Molecule {
+	out := &Molecule{
+		ID:       m.ID,
+		Name:     m.Name,
+		MaxPhase: m.MaxPhase,
+		Type:     m.Type,
+	}
+	if m.Props != nil {
+		out.Formula = m.Props.Formula
+		out.MolWeight = m.Props.MolWeight
+	}
+	if m.Structs != nil {
+		out.SMILES = m.Structs.SMILES
 	}
 	return out
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// Target is a ChEMBL biological target.
+type Target struct {
+	ID       string `json:"target_chembl_id" kit:"id"`
+	Name     string `json:"pref_name" kit:"body"`
+	Type     string `json:"target_type"`
+	Organism string `json:"organism"`
+	TaxID    int    `json:"tax_id,omitempty"`
+}
+
+// Activity is a single bioactivity measurement from ChEMBL.
+type Activity struct {
+	ActivityID   int    `json:"activity_id" kit:"id"`
+	AssayID      string `json:"assay_chembl_id"`
+	MoleculeID   string `json:"molecule_chembl_id"`
+	TargetID     string `json:"target_chembl_id"`
+	TargetName   string `json:"target_pref_name" kit:"body"`
+	ActivityType string `json:"activity_type"`
+	Value        string `json:"value"`
+	Units        string `json:"units"`
+}
+
+// ---------------------------------------------------------------------------
+// API helpers
+// ---------------------------------------------------------------------------
+
+type moleculeListResp struct {
+	Molecules []*molecule `json:"molecules"`
+	PageMeta  PageMeta    `json:"page_meta"`
+}
+
+type targetListResp struct {
+	Targets  []*Target `json:"targets"`
+	PageMeta PageMeta  `json:"page_meta"`
+}
+
+type activityListResp struct {
+	Activities []*Activity `json:"activities"`
+	PageMeta   PageMeta    `json:"page_meta"`
+}
+
+// PageMeta holds pagination metadata from a list response.
+type PageMeta struct {
+	TotalCount int `json:"total_count"`
+	Limit      int `json:"limit"`
+	Offset     int `json:"offset"`
+}
+
+// Molecule fetches a single molecule by its ChEMBL ID (e.g. "CHEMBL25").
+func (c *Client) Molecule(ctx context.Context, id string) (*Molecule, error) {
+	u := c.cfg.BaseURL + "/molecule/" + url.PathEscape(id) + ".json"
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, fmt.Errorf("molecule %s: %w", id, err)
 	}
-	return s
+	var m molecule
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, fmt.Errorf("molecule %s: decode: %w", id, err)
+	}
+	return flatMolecule(&m), nil
+}
+
+// SearchMolecules searches molecules by name or SMILES query.
+func (c *Client) SearchMolecules(ctx context.Context, q string, limit int) ([]*Molecule, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	u := fmt.Sprintf("%s/molecule/search.json?q=%s&limit=%d",
+		c.cfg.BaseURL, url.QueryEscape(q), limit)
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, fmt.Errorf("search molecules %q: %w", q, err)
+	}
+	var resp moleculeListResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("search molecules %q: decode: %w", q, err)
+	}
+	out := make([]*Molecule, 0, len(resp.Molecules))
+	for _, m := range resp.Molecules {
+		out = append(out, flatMolecule(m))
+	}
+	return out, nil
+}
+
+// Target fetches a single target by its ChEMBL ID.
+func (c *Client) Target(ctx context.Context, id string) (*Target, error) {
+	u := c.cfg.BaseURL + "/target/" + url.PathEscape(id) + ".json"
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, fmt.Errorf("target %s: %w", id, err)
+	}
+	var t Target
+	if err := json.Unmarshal(body, &t); err != nil {
+		return nil, fmt.Errorf("target %s: decode: %w", id, err)
+	}
+	return &t, nil
+}
+
+// SearchTargets searches targets by name query.
+func (c *Client) SearchTargets(ctx context.Context, q string, limit int) ([]*Target, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	u := fmt.Sprintf("%s/target/search.json?q=%s&limit=%d",
+		c.cfg.BaseURL, url.QueryEscape(q), limit)
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, fmt.Errorf("search targets %q: %w", q, err)
+	}
+	var resp targetListResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("search targets %q: decode: %w", q, err)
+	}
+	return resp.Targets, nil
+}
+
+// Activities fetches bioactivities filtered by molecule or target ChEMBL ID.
+// At least one of moleculeID or targetID must be non-empty.
+func (c *Client) Activities(ctx context.Context, moleculeID, targetID string, limit int) ([]*Activity, error) {
+	if moleculeID == "" && targetID == "" {
+		return nil, fmt.Errorf("activities: at least one of molecule or target ID required")
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	params := url.Values{}
+	if moleculeID != "" {
+		params.Set("molecule_chembl_id", moleculeID)
+	}
+	if targetID != "" {
+		params.Set("target_chembl_id", targetID)
+	}
+	params.Set("limit", fmt.Sprintf("%d", limit))
+	u := c.cfg.BaseURL + "/activity.json?" + params.Encode()
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, fmt.Errorf("activities: %w", err)
+	}
+	var resp activityListResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("activities: decode: %w", err)
+	}
+	return resp.Activities, nil
 }

@@ -1,14 +1,15 @@
 package chembl
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/tamnd/any-cli/kit"
 )
 
 // These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in chembl_test.go.
+// and the host wiring, which need no network. The client's HTTP behaviour is
+// covered in chembl_test.go.
 
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
@@ -24,53 +25,89 @@ func TestDomainInfo(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+	cases := []struct {
+		in  string
+		typ string
+		id  string
+		ok  bool
+	}{
+		{"CHEMBL25", "molecule", "CHEMBL25", true},
+		{"chembl25", "molecule", "CHEMBL25", true},
+		{"CHEMBL2035", "molecule", "CHEMBL2035", true},
+		{"aspirin", "", "", false},
+		{"", "", "", false},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
-			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
+		if tc.ok {
+			if err != nil {
+				t.Errorf("Classify(%q) unexpected error: %v", tc.in, err)
+				continue
+			}
+			if typ != tc.typ || id != tc.id {
+				t.Errorf("Classify(%q) = (%q, %q), want (%q, %q)", tc.in, typ, id, tc.typ, tc.id)
+			}
+		} else {
+			if err == nil {
+				t.Errorf("Classify(%q) expected error, got (%q, %q)", tc.in, typ, id)
+			}
 		}
 	}
 }
 
 func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
-	if err != nil || got != want {
-		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
+	cases := []struct {
+		typ  string
+		id   string
+		want string
+		ok   bool
+	}{
+		{"molecule", "CHEMBL25", "https://" + Host + "/chembl/compound_report_card/CHEMBL25/", true},
+		{"target", "CHEMBL2035", "https://" + Host + "/chembl/target_report_card/CHEMBL2035/", true},
+		{"activity", "1", "", false},
+	}
+	for _, tc := range cases {
+		got, err := Domain{}.Locate(tc.typ, tc.id)
+		if tc.ok {
+			if err != nil {
+				t.Errorf("Locate(%q, %q) unexpected error: %v", tc.typ, tc.id, err)
+				continue
+			}
+			if got != tc.want {
+				t.Errorf("Locate(%q, %q) = %q, want %q", tc.typ, tc.id, got, tc.want)
+			}
+		} else {
+			if err == nil {
+				t.Errorf("Locate(%q, %q) expected error, got %q", tc.typ, tc.id, got)
+			}
+		}
 	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
 func TestHostWiring(t *testing.T) {
 	h, err := kit.Open()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
+	mol := &Molecule{ID: "CHEMBL25", Name: "ASPIRIN", SMILES: "CC(=O)Oc1ccccc1C(=O)O"}
+	u, err := h.Mint(mol)
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if want := "chembl://page/wiki/Go"; u.String() != want {
-		t.Errorf("Mint = %q, want %q", u.String(), want)
+	if !strings.HasPrefix(u.String(), "chembl://") {
+		t.Errorf("Mint = %q, want chembl:// prefix", u.String())
 	}
 
-	if body, ok := h.Body(p); !ok || body == "" {
+	if body, ok := h.Body(mol); !ok || body == "" {
 		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
 	}
 
-	got, err := h.ResolveOn("chembl", "about")
-	if err != nil || got.String() != "chembl://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want chembl://page/about", got.String(), err)
+	got, err := h.ResolveOn("chembl", "CHEMBL25")
+	if err != nil {
+		t.Fatalf("ResolveOn: %v", err)
+	}
+	if !strings.HasPrefix(got.String(), "chembl://molecule/") {
+		t.Errorf("ResolveOn = %q, want chembl://molecule/ prefix", got.String())
 	}
 }

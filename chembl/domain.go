@@ -2,30 +2,25 @@ package chembl
 
 import (
 	"context"
-	"net/url"
+	"fmt"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes chembl as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
+// domain.go exposes chembl as a kit Domain. A multi-domain host (ant) enables
+// it with a single blank import:
 //
 //	import _ "github.com/tamnd/chembl-cli/chembl"
 //
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// chembl:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone chembl binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// The init below registers it; the host then dereferences chembl:// URIs by
+// routing to the operations Register installs. The same Domain also builds the
+// standalone chembl binary (see cli.NewApp), so the binary and a host share
+// one source of truth.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the chembl driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the ChEMBL driver.
 type Domain struct{}
 
 // Info describes the scheme, the hostnames a pasted link is matched against, and
@@ -39,7 +34,7 @@ func (Domain) Info() kit.DomainInfo {
 			Short:  "CLI for the ChEMBL drug and bioactivity database",
 			Long: `CLI for the ChEMBL drug and bioactivity database
 
-chembl reads public chembl data over plain HTTPS, shapes it into
+chembl reads public ChEMBL data via the EBI REST API, shapes it into
 clean records, and prints output that pipes into the rest of your tools. No API
 key, nothing to run alongside it.`,
 			Site: Host,
@@ -48,30 +43,33 @@ key, nothing to run alongside it.`,
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `chembl page` and
-	// `ant get chembl://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// molecule: get a single molecule by ChEMBL ID.
+	kit.Handle(app, kit.OpMeta{Name: "molecule", Group: "read", Single: true,
+		Summary: "Get a molecule by ChEMBL ID (e.g. CHEMBL25)", URIType: "molecule", Resolver: true,
+		Args: []kit.Arg{{Name: "id", Help: "ChEMBL molecule ID"}}}, getMolecule)
 
-	// List op: members of a page, the home of `chembl links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// chembl://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// search: search molecules or targets.
+	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read", List: true,
+		Summary: "Search molecules or targets by name or SMILES",
+		Args:    []kit.Arg{{Name: "query", Help: "search query"}}}, doSearch)
+
+	// target: get a single target by ChEMBL ID.
+	kit.Handle(app, kit.OpMeta{Name: "target", Group: "read", Single: true,
+		Summary: "Get a target by ChEMBL ID", URIType: "target", Resolver: true,
+		Args: []kit.Arg{{Name: "id", Help: "ChEMBL target ID"}}}, getTarget)
+
+	// activity: list bioactivities filtered by molecule or target.
+	kit.Handle(app, kit.OpMeta{Name: "activity", Group: "read", List: true,
+		Summary: "List bioactivities for a molecule or target"}, getActivities)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +80,143 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClientWithConfig(c), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// ---------------------------------------------------------------------------
+// Input structs
+// ---------------------------------------------------------------------------
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type moleculeIn struct {
+	ID     string  `kit:"arg" help:"ChEMBL molecule ID (e.g. CHEMBL25)"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type searchIn struct {
+	Query  string  `kit:"arg" help:"search query (name or SMILES)"`
+	Limit  int     `kit:"flag,inherit" help:"max results (default 20)"`
+	Type   string  `kit:"flag" help:"resource type: molecule or target (default: molecule)"`
 	Client *Client `kit:"inject"`
 }
 
-// --- handlers ---
-
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
-	}
-	return emit(p)
+type targetIn struct {
+	ID     string  `kit:"arg" help:"ChEMBL target ID (e.g. CHEMBL2035)"`
+	Client *Client `kit:"inject"`
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+type activityIn struct {
+	Molecule string  `kit:"flag" help:"filter by molecule ChEMBL ID"`
+	Target   string  `kit:"flag" help:"filter by target ChEMBL ID"`
+	Limit    int     `kit:"flag,inherit" help:"max results (default 20)"`
+	Client   *Client `kit:"inject"`
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+func getMolecule(ctx context.Context, in moleculeIn, emit func(*Molecule) error) error {
+	mol, err := in.Client.Molecule(ctx, in.ID)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	return emit(mol)
+}
+
+func doSearch(ctx context.Context, in searchIn, emit func(any) error) error {
+	rtype := strings.ToLower(strings.TrimSpace(in.Type))
+	if rtype == "" {
+		rtype = "molecule"
+	}
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	switch rtype {
+	case "molecule":
+		results, err := in.Client.SearchMolecules(ctx, in.Query, limit)
+		if err != nil {
+			return mapErr(err)
+		}
+		for _, m := range results {
+			if err := emit(m); err != nil {
+				return err
+			}
+		}
+	case "target":
+		results, err := in.Client.SearchTargets(ctx, in.Query, limit)
+		if err != nil {
+			return mapErr(err)
+		}
+		for _, t := range results {
+			if err := emit(t); err != nil {
+				return err
+			}
+		}
+	default:
+		return errs.Usage("unknown type %q: use molecule or target", rtype)
+	}
+	return nil
+}
+
+func getTarget(ctx context.Context, in targetIn, emit func(*Target) error) error {
+	t, err := in.Client.Target(ctx, in.ID)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(t)
+}
+
+func getActivities(ctx context.Context, in activityIn, emit func(*Activity) error) error {
+	if in.Molecule == "" && in.Target == "" {
+		return errs.Usage("at least one of --molecule or --target is required")
+	}
+	acts, err := in.Client.Activities(ctx, in.Molecule, in.Target, in.Limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, a := range acts {
+		if err := emit(a); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+// ---------------------------------------------------------------------------
+// Resolver: URI driver string functions (network-free)
+// ---------------------------------------------------------------------------
 
-// Classify turns any accepted input — a bare path or a full chembl.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// Classify turns any accepted input into the canonical (type, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized chembl reference: %q", input)
+	input = strings.TrimSpace(input)
+	if strings.HasPrefix(strings.ToUpper(input), "CHEMBL") {
+		// Heuristic: targets usually have names like CHEMBL2035 and molecules
+		// like CHEMBL25. We can't know without a network call, so default to
+		// molecule.
+		return "molecule", strings.ToUpper(input), nil
 	}
-	return "page", id, nil
+	return "", "", errs.Usage("unrecognized ChEMBL reference: %q", input)
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "molecule":
+		return fmt.Sprintf("https://%s/chembl/compound_report_card/%s/", Host, id), nil
+	case "target":
+		return fmt.Sprintf("https://%s/chembl/target_report_card/%s/", Host, id), nil
+	default:
 		return "", errs.Usage("chembl has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
-// --- helpers ---
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
 func mapErr(err error) error {
 	return err
 }
