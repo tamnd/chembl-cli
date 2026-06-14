@@ -1,0 +1,10 @@
+title       = "chembl"
+baseURL     = "https://chembl-cli.tamnd.com/"
+description = "CLI for the ChEMBL drug and bioactivity database"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/chembl-cli"
